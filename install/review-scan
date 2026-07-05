@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+import sys, os
+sys.argv[0] = os.path.expanduser("~/.claude/tools/review_scan.py")
+exec(open(sys.argv[0]).read())
