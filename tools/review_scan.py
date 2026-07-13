@@ -292,6 +292,205 @@ def get_extra_exclude_dirs(cfg):
     dirs = cfg.get("exclude_dirs", [])
     return set(dirs) if isinstance(dirs, list) else set()
 
+
+# ---------------------------------------------------------------------------
+# Verification runner (regression check after fix)
+# ---------------------------------------------------------------------------
+
+def get_verification_commands(cfg):
+    """Return verification commands from .code-review.yml config."""
+    ver = cfg.get("verification", {})
+    if isinstance(ver, dict):
+        return ver.get("commands", [])
+    return []
+
+
+def path_matches_glob(path, patterns):
+    """Check if path matches any glob pattern (for on_paths filtering)."""
+    if not patterns:
+        return True
+    from fnmatch import fnmatch
+    p = str(path).replace("\\", "/")
+    for pat in patterns:
+        if fnmatch(p, pat) or fnmatch(p, "*/" + pat):
+            return True
+    return False
+
+
+def discover_default_verification(unit_root, langs):
+    """Auto-discover default verification commands based on project type."""
+    commands = []
+    root = Path(unit_root)
+
+    # Python
+    if "python" in langs:
+        # pytest
+        if (root / "pytest.ini").is_file() or (root / "pyproject.toml").is_file():
+            commands.append({
+                "name": "pytest",
+                "run": "pytest",
+                "cwd": ".",
+                "on_risk": ["HIGH", "MID", "LOW"],
+            })
+        else:
+            # Check for tests/ directory
+            if any((root / "tests").rglob("test_*.py")) or (root / "tests").exists():
+                commands.append({
+                    "name": "pytest",
+                    "run": "pytest",
+                    "cwd": ".",
+                    "on_risk": ["HIGH", "MID", "LOW"],
+                })
+        # compileall fallback
+        commands.append({
+            "name": "python compileall",
+            "run": "python -m compileall .",
+            "cwd": ".",
+            "on_risk": ["HIGH", "MID", "LOW"],
+        })
+
+    # Java
+    if "java" in langs:
+        if (root / "pom.xml").is_file():
+            commands.append({
+                "name": "mvn test",
+                "run": "mvn test",
+                "cwd": ".",
+                "on_risk": ["HIGH", "MID"],
+            })
+        elif (root / "build.gradle").is_file() or (root / "build.gradle.kts").is_file():
+            commands.append({
+                "name": "gradle test",
+                "run": "gradle test",
+                "cwd": ".",
+                "on_risk": ["HIGH", "MID"],
+            })
+
+    # JS/TS
+    if "js" in langs:
+        pkg = root / "package.json"
+        if pkg.is_file():
+            try:
+                import json
+                with open(pkg, "r", encoding="utf-8") as fh:
+                    pkg_data = json.load(fh)
+                scripts = pkg_data.get("scripts", {})
+                if "test" in scripts:
+                    commands.append({
+                        "name": "npm test",
+                        "run": "npm test",
+                        "cwd": ".",
+                        "on_risk": ["HIGH", "MID", "LOW"],
+                    })
+                if "build" in scripts:
+                    commands.append({
+                        "name": "npm run build",
+                        "run": "npm run build",
+                        "cwd": ".",
+                        "on_risk": ["HIGH", "MID", "LOW"],
+                    })
+            except Exception:
+                pass
+        # TypeScript typecheck fallback
+        if (root / "tsconfig.json").is_file():
+            commands.append({
+                "name": "tsc --noEmit",
+                "run": "npx tsc --noEmit",
+                "cwd": ".",
+                "on_risk": ["HIGH", "MID", "LOW"],
+            })
+
+    return commands
+
+
+def run_verification(unit_root, commands, risk, changed_files_list):
+    """Run verification commands and return results.
+
+    Returns (passed: bool, results: list of dicts).
+    Each result dict: {name, passed, exit_code, stdout, stderr}.
+    """
+    results = []
+    passed = True
+    root = Path(unit_root)
+
+    for cmd_spec in commands:
+        name = cmd_spec.get("name", "?")
+        run_cmd = cmd_spec.get("run", "")
+        cwd = cmd_spec.get("cwd", ".")
+        on_risk = cmd_spec.get("on_risk", ["HIGH", "MID", "LOW"])
+        on_paths = cmd_spec.get("on_paths", [])
+        expect_exit = cmd_spec.get("expect_exit", 0)
+        timeout = cmd_spec.get("timeout", 300)
+
+        # Filter by risk level
+        if risk not in on_risk:
+            continue
+
+        # Filter by changed file paths
+        if on_paths and changed_files_list:
+            matched = False
+            for cf in changed_files_list:
+                if path_matches_glob(cf, on_paths):
+                    matched = True
+                    break
+            if not matched:
+                continue
+
+        # Execute command
+        cwd_path = root / cwd if not Path(cwd).is_absolute() else Path(cwd)
+        if not cwd_path.is_dir():
+            cwd_path = root
+
+        try:
+            out = subprocess.run(
+                run_cmd, shell=True, cwd=str(cwd_path),
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=timeout)
+            cmd_passed = out.returncode == expect_exit
+            results.append({
+                "name": name,
+                "passed": cmd_passed,
+                "exit_code": out.returncode,
+                "stdout": out.stdout[:2000] if out.stdout else "",
+                "stderr": out.stderr[:2000] if out.stderr else "",
+            })
+            if not cmd_passed:
+                passed = False
+        except subprocess.TimeoutExpired:
+            results.append({
+                "name": name,
+                "passed": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Timeout after {timeout}s",
+            })
+            passed = False
+        except Exception as e:
+            results.append({
+                "name": name,
+                "passed": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": str(e),
+            })
+            passed = False
+
+    return passed, results
+
+
+def print_verification_summary(ver_results):
+    """Print verification results to stdout."""
+    if not ver_results:
+        return
+    print("\n=== Verification ===")
+    for r in ver_results:
+        status = "PASS" if r["passed"] else "FAIL"
+        print(f"  [{status}] {r['name']} (exit={r['exit_code']})")
+        if not r["passed"]:
+            if r.get("stderr"):
+                print(f"       {r['stderr'][:200]}")
+
+
 # ---------------------------------------------------------------------------
 # Phase 0: Project auto-discovery
 # ---------------------------------------------------------------------------
@@ -1060,7 +1259,7 @@ def risk_level(files):
 # Output
 # ---------------------------------------------------------------------------
 
-def print_summary(risk, total_files):
+def print_summary(risk, total_files, ver_results=None):
     print(f"\n=== Deterministic Code Review Scan ===")
     print(f"Risk level: {risk}  |  Files scanned: {total_files}")
     by_cat = {}
@@ -1082,6 +1281,9 @@ def print_summary(risk, total_files):
             print(f"       {f['evidence']}")
         if len(items) > 15:
             print(f"  ... {len(items) - 15} more (use --json for all)")
+
+    if ver_results is not None:
+        print_verification_summary(ver_results)
 
 # ---------------------------------------------------------------------------
 # Selftest (self-contained fixtures, no dependency on real projects)
@@ -1263,6 +1465,20 @@ def selftest():
     # So framework detection may return empty — that's OK, just verify it doesn't crash
     check(True, "Framework detection runs without error (may return empty for fixture)")
 
+    # --- Fixture 14: Verification runner ---
+    _findings.clear()
+    ver_passed, ver_results = run_verification(
+        tmpdir, [
+            {"name": "echo ok", "run": "echo ok", "cwd": ".", "on_risk": ["HIGH", "MID", "LOW"], "expect_exit": 0}
+        ], "HIGH", [tmpdir / "dummy.py"])
+    check(ver_passed, "Verification runner: passing command passes")
+
+    ver_passed2, ver_results2 = run_verification(
+        tmpdir, [
+            {"name": "failing", "run": "exit 1", "cwd": ".", "on_risk": ["HIGH", "MID", "LOW"], "expect_exit": 0}
+        ], "HIGH", [tmpdir / "dummy.py"])
+    check(not ver_passed2, "Verification runner: failing command fails")
+
     # Cleanup
     import shutil
     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1285,6 +1501,8 @@ def main():
                     help="Full scan (default: scan git uncommitted changes)")
     ap.add_argument("--base", help="Diff against specified base ref")
     ap.add_argument("--json", action="store_true", help="JSON output")
+    ap.add_argument("--verify", action="store_true",
+                    help="Run verification commands after scan (from .code-review.yml)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1328,11 +1546,41 @@ def main():
 
     risk = risk_level(all_files)
 
+    # Verification (if --verify)
+    ver_results = None
+    ver_passed = True
+    if args.verify:
+        ver_cmds = get_verification_commands(cfg)
+        if not ver_cmds:
+            # Auto-discover default commands
+            for unit_name, unit_root, langs in units:
+                ver_cmds = discover_default_verification(unit_root, langs)
+                if ver_cmds:
+                    break
+        if ver_cmds:
+            # Use first unit's root for verification
+            first_unit_root = units[0][1] if units else root
+            ver_passed, ver_results = run_verification(
+                first_unit_root, ver_cmds, risk, all_files)
+        else:
+            ver_results = [{"name": "auto-discovery", "passed": True,
+                           "exit_code": 0, "stdout": "", "stderr":
+                           "No verification commands configured or auto-discovered"}]
+
     if args.json:
-        print(json.dumps({"risk": risk, "file_count": len(all_files),
-                          "findings": _findings}, ensure_ascii=False, indent=2))
+        output = {"risk": risk, "file_count": len(all_files),
+                  "findings": _findings}
+        if ver_results is not None:
+            output["verification"] = {"passed": ver_passed, "results": ver_results}
+        print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
-        print_summary(risk, len(all_files))
+        print_summary(risk, len(all_files), ver_results)
+
+    # Return non-zero if findings or verification failed
+    if _findings:
+        return 1
+    if args.verify and not ver_passed:
+        return 1
     return 0
 
 
