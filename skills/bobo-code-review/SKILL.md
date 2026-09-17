@@ -8,6 +8,7 @@ description: Use when the user says "代码审查", "review 一下", "帮我审�
 > 八步流程：范围→扫描→对抗→根因→修复→重扫→报告→闭环。
 > 这不是"读 diff 给意见"——这是**对抗式审查 + 第一性原理根因升华**的完整工作流。
 > 唯一硬输出：**通过**（零 P0/P1 + 零 plausible_blocking）或**不通过**。
+> 另叠加 **ocr 独立信号**（阿里 open-code-review，非门禁，见下方专节）。
 
 ## 与普通 review 的区别
 
@@ -23,7 +24,7 @@ description: Use when the user says "代码审查", "review 一下", "帮我审�
 | 用户说 | 走哪些步 |
 |---|---|
 | "代码审查" / "CR" / "review 一下" | 全流程 1→2→3→4→5→6→7→8 |
-| "快速扫一下" / "有没有明显问题" | 1→2→7（只扫描，不做对抗） |
+| "快速扫一下" / "有没有明显问题" | 1→2→ocr→7（扫描 + ocr 独立信号，不做对抗） |
 | "验证修复" / "重审" | 5→6→8（重扫+重审已修复项） |
 
 ## 八步流程
@@ -51,6 +52,8 @@ description: Use when the user says "代码审查", "review 一下", "帮我审�
 无 `review-scan` 时降级为 grep/opengrep 手动扫，但必须覆盖以上全部维度。
 
 输出格式：每条 finding 含 `id / project / subsystem / file / line / category / severity / evidence`。`route` 类标 INFO（供审查参考），其余标 P0-P2。
+
+**叠加 ocr 独立信号（非门禁）**：`ocr review`，用法见下方专节；其发现并入第 3 步四态判定，不自动确认。
 
 ### 3. 阶段 B — 对抗审查
 **仅当有 actionable findings（非 INFO）时执行。** 分两轮：
@@ -127,6 +130,34 @@ description: Use when the user says "代码审查", "review 一下", "帮我审�
 - **不允许**：用"我改完了"代替验证——必须实际跑通重扫/重审/验证
 - **不允许**：跳过任何一步。不允许声称"完成了"除非流程以「通过」终止
 
+## OCR 独立 finder（阿里 open-code-review，非门禁）
+
+> **定位**：独立信号 / 廉价第一遍，**不是门禁**。「通过/不通过」仍只由八步闭环判定；ocr 的发现一律作为待四态判定的输入，不自动确认——它召回率有意偏低（重精度轻噪音），**勿以"ocr 没报"当"没问题"**。
+
+**安装配置（一次性）**：
+
+```bash
+npm install -g @alibaba-group/open-code-review   # 要求 Git ≥ 2.41
+ocr config set provider deepseek
+ocr config set providers.deepseek.api_key "$DEEPSEEK_API_KEY"
+```
+
+无 API key 的环境用 delegation 模式（`ocr delegate preview` / `ocr delegate rule`：ocr 只做文件选择+规则解析，审查由本 agent 以自身模型执行）。
+
+**用法**（必须在 git 仓库目录内跑；多仓库工作区各仓库各跑一次，工作区根目录本身不是仓库）：
+
+- 全流程（高危）：作为阶段 C 的独立 finder 之一，加 `--background "<业务上下文>"`；中危：阶段 A 后作第一遍
+- 快速扫描：`ocr review --preview` 先看范围控成本，再 `ocr review --format json --output .claude/ocr-findings.json --audience agent`
+- 单提交 `--commit <sha>`；区间 `--from <base> --to <ref>`；排除产物 `--exclude '**/generated/*,**/testdata/*'`
+- 输出映射：comment = `{path, content, start_line, end_line, category, severity, existing_code}`；severity→P 级**候选** critical→P0 / high→P1 / medium→P2 / low→P3，全部进第 3 步四态判定（`existing_code` 作 evidence）
+
+**已知坑**（2026-09-17 生产代码实测校准）：
+
+1. **召回偏低是设计**：对已知答案集（1 P0+3 P1+1 P2）命中 0/5——只可叠加、不可替代；**合并冲突审查仍以三方计数为准**（`git show merge^1/^2/merge:<file> | grep -c <关键语句>`）
+2. 噪音低：对四轮过审的代码仅 3 条 low、零高/中危误报（抽验 3/3 属实）；同一问题可能重复上报，汇总按 path+line 去重
+3. **强项=跨文件交互缺陷**：曾从 113 文件大合并里揪出生产在跑的心跳自杀 P0（两条各自过审的特性交互致任务误判死+成片丢失，多轮人工审查均漏掉）
+4. Windows 下日志见 `✘ code_search failed`（git grep 转义 bug）属工具问题，勿中断流程；preset 钉死 deepseek-flash，换模型用 `--model`；大 diff 必先 `--preview`（113 文件 ≈ 2600 万 token、92.8% 缓存读、约 5 分钟；4 文件 ≈ 88 万 token、约 1 分钟）
+
 ## 跨模型对抗
 
 skeptic agent 必须用与 review agent **不同**的模型。当前可用模型：
@@ -156,3 +187,34 @@ skeptic agent 必须用与 review agent **不同**的模型。当前可用模型
 5. 先出方案再改代码——口头"改吧"不能直接动手
 6. 有测量才给数字——所有计数必须来自工具输出
 7. **验证失败 = 不通过。不允许跳过构建/类型/测试验证。**
+
+---
+
+## 提交门禁集成（review-gate）
+
+**目的**：`git commit` / `git push` / 部署命令（deploy、vercel、wrangler、terraform apply、kubectl apply/delete/patch、helm、docker push 等）执行前，PreToolUse 钩子 `~/.claude/hooks/review-gate.ps1` 会检查审查标记。无今日有效标记 → 命令被拦截，并提示先运行本流程。
+
+**标记写入规则（本 skill 必须遵守）**：
+
+1. **「通过」终止时**（第 8 步判定通过）：写入标记，使本轮审查成果可放行一次提交/推送/部署：
+   ```powershell
+   $g = Join-Path $env:USERPROFILE '.claude\review-gate'
+   $full = (Resolve-Path '.').Path.TrimEnd('\')
+   $sha = [System.Security.Cryptography.SHA256]::Create()
+   $b = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($full.ToLower()))
+   $sha.Dispose()
+   $h = -join ($b[0..7] | ForEach-Object { $_.ToString('x2') })
+   Set-Content -Path (Join-Path $g "$h.ok") -Value (Get-Date -Format 'yyyy-MM-dd') -NoNewline
+   ```
+2. **「不通过」终止时**：删除对应标记文件（存在则删）：
+   ```powershell
+   $g = Join-Path $env:USERPROFILE '.claude\review-gate'
+   $full = (Resolve-Path '.').Path.TrimEnd('\')
+   $sha = [System.Security.Cryptography.SHA256]::Create()
+   $b = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($full.ToLower()))
+   $sha.Dispose()
+   $h = -join ($b[0..7] | ForEach-Object { $_.ToString('x2') })
+   Remove-Item -Path (Join-Path $g "$h.ok") -Force -ErrorAction SilentlyContinue
+   ```
+3. 未跑完流程（中途终止）不得写标记；不得为绕过门禁编造或伪造标记。
+4. 标记有效期一天（仅当天放行）。放行后钩子自动将标记移入 `.stamp/`，新一轮提交需重新审查。
