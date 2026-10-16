@@ -3,138 +3,88 @@ name: bobo-code-review
 description: Use when the user says "代码审查", "review 一下", "帮我审查", "CR", or expresses intent to review code changes. Use when changes touch auth, API routes, sensitive data, or deletion logic. Use when the user wants a thorough review, not just a quick check.
 ---
 
-# 代码审查工作流
+# 代码审查（先分档，再按档做事）
 
-> 八步流程：范围→扫描→对抗→根因→修复→重扫→报告→闭环。
-> 这不是"读 diff 给意见"——这是**对抗式审查 + 第一性原理根因升华**的完整工作流。
-> 唯一硬输出：**通过**（零 P0/P1 + 零 plausible_blocking）或**不通过**。
-> 另叠加 **ocr 独立信号**（阿里 open-code-review，非门禁，见下方专节）。
+唯一硬输出：**通过**（零 P0/P1、零未解决 `plausible_blocking`、验证全过）或**不通过**。
+审查深度跟着**风险**走，不跟着触发词走。
 
-## 与普通 review 的区别
+## 1. 范围与扫描（每档都先做）
 
-| 普通 review | 本工作流 |
+1. `git status --short`、`git diff --stat` 定范围。多仓库工作区进实际仓库目录；worktree 把 `--root` 指到该检出。
+2. 确定性扫描（零模型、可复现）：`review-scan --root <目录> [--base <ref>]`。项目若有自己的扫描器，用那个，参数对齐即可。
+   默认扫未提交改动，**含未跟踪的新文件**；`--full` 才全量。只看它打印的风险等级和范围内发现。「另有 N 条存量命中」是改动没碰到的老问题，已降为 INFO，不用审。
+3. 扫描产物超过 32KB 时，先按严重度摘要再读，不要整份读入。
+
+## 2. 定档
+
+| 档 | 条件（满足任一） | 做什么 |
+|---|---|---|
+| LOW | 风险等级 LOW，且无范围内 P0/P1 | §3 |
+| MID | 风险等级 MID；LOW 档扫出范围内 P0/P1；改动以删除为主（删校验、拦截、守卫） | §3 + §4，复核面 ≤3 |
+| HIGH | 风险等级 HIGH；用户说「全量 / 对抗 / 深审 / 部署前」；合并提交、>20 文件、跨仓库 | §3 + §4 + §5 |
+
+改动量不等于风险量：一行改默认模型、扣费、鉴权，按 HIGH。拿不准往上升一档，不往下降。
+
+## 3. 轻审（所有档的底座，主 agent 自己做，不派子代理）
+
+1. LOW 档通读 diff 和未跟踪新文件；MID / HIGH 档读 `--stat` 与扫描摘要，细读交给复核面。按触及面过清单，没碰到的不过：
+   - 路由 / 依赖：鉴权 5 问——有鉴权依赖？身份来自服务端凭证？资源归属比对？批量逐项校验？越权（IDOR）？
+   - 接受外部 URL：是否校验目标地址。删除：下游存储是否全清、顺序、失败回滚。
+   - 异步任务：终态是否落库、中断重放是否幂等。扣费：冻结 → 结算 → 退款同链、幂等。新文件 / 新路由必审。
+2. 范围内 P2：在主上下文里一句话处置（修 / 登记 / refuted 并写依据），**不送对抗**。
+3. 验证：
+   - LOW：只跑类型 / 编译检查和与改动直接相关的测试文件。
+   - MID / HIGH：`review-scan --root <目录> --verify`（按 `.code-review.yml` 选命令；HIGH 加 `--full`）。未配置验证命令时，手动跑等效命令并写进报告，不能默认通过。
+   - **验证失败 = 不通过，不允许跳过。**
+
+## 4. 对抗（MID / HIGH）
+
+项目若有对抗审查 workflow，用它，并遵守下面的输入约束。没有就派两个子代理：审查员判定，skeptic 用**不同模型**独立复现。skeptic 不得与审查员同模型。
+
+- 只送 `--json --actionable` 里**范围内的 P0/P1**。P2 不送。id 须唯一。
+- 复核面按触及面选，MID ≤3，HIGH 按触及的类别数，不预设固定个数。问法写成「证伪 X」并点名文件。
+
+| 触及 | 复核面 |
 |---|---|
-| 读 diff → 列问题 | 先确定性扫描（事实清单，零幻觉） |
-| 单人判断 | 对抗式——review agent 判定 + skeptic agent 从三视角质疑 |
-| "这里没鉴权" | "为什么鉴权靠手动加？同类还有哪些？是 isolated 还是 systemic？" |
-| 修完结束 | 修完→重扫→重审→闭环判定通过 |
+| 路由 / 鉴权 / 权限 | 鉴权逐路由（5 问）+ 攻击者视角：无鉴权且可枚举 = IDOR |
+| 扣费 / 额度 / 积分 | 业务正确性（冻结 → 结算 → 退款同链、幂等）+ 并发竞态 |
+| 删除 / 迁移 / 对象存储 | 跨存储原子性：下游全清单、顺序、失败回滚 |
+| 任务 / worker / 队列 | 异步生命周期 + 并发竞态 |
+| 重试 / 超时 / 外部调用 | 错误吞没、超时与重试会不会重复提交或重复扣费、SSRF |
+| 前端状态 / 组件 | 状态机：初始化顺序、卸载竞态、重复提交 |
+| 修复型提交 | 修复回归预测：查全部消费方；测试是否自证式 |
+| 新文件 / 新路由 | 新增代码专项 |
 
-## 模式选择
+复核员不要跑全量测试或构建；需要实证只跑最小探针或单文件测试。验证只跑一次。
 
-| 用户说 | 走哪些步 |
-|---|---|
-| "代码审查" / "CR" / "review 一下" | 全流程 1→2→3→4→5→6→7→8 |
-| "快速扫一下" / "有没有明显问题" | 1→2→ocr→7（扫描 + ocr 独立信号，不做对抗） |
-| "验证修复" / "重审" | 5→6→8（重扫+重审已修复项） |
+判定口径：`plausible_blocking` / 未能独立复现的项**不得因「证据不足」降级**；`refuted` 必须有正面反驳证据。审查员判 `refuted` 而攻击者能利用 → 升级。报告里如实写 skeptic 实际用的模型，不猜不编。
 
-## 八步流程
+## 5. HIGH 加码
 
-### 1. 确定范围
-- 确认审查目标（整个项目 / 某个子系统 / 未提交改动 / PR diff）
-- 确认当前分支（若是工作区则确认是否在生产分支）
-- diff 基线：默认未提交改动；`--full` 全量；`--base <ref>` 指定对比基线
+- **跨模型**：skeptic 必须与审查员不同模型。首选不可用时按备选降级，并在报告里写实际模型、换的原因和报错码。
+- **根因升华**（仅 P0/P1）：本质是什么？为什么出现？同类还有哪些？`isolated` 还是 `systemic`？systemic 再问：治症状还是根因、覆盖所有同类吗、不治根因会在哪复发。
+- **ocr 独立信号**（非门禁，只在 HIGH）：合并提交、>20 文件或跨仓库时才跑。召回偏低，「ocr 没报」不等于没问题。发现并入 §4 当待判定输入，不自动确认，按 path + line 去重。用法见下方专节。
 
-### 2. 阶段 A — 确定性扫描
-**目标**：产出事实清单（非判断），零幻觉、可复现。
+## 6. 不通过 → 修复 → 复审
 
-**优先用 `review-scan`（通用确定性扫描器）**——它自动发现项目结构（manifest → project unit）、识别框架（FastAPI/Flask/Django/Express/NestJS/Koa/Spring/gin/echo/axum/actix 等）、遍历全部源码目录、扫描以下七维度：
+- 修复先出方案，用户确认后再改（口头「改吧」不算确认）。
+- 复审只审**修复增量**（`git diff <上轮已审提交>..`），再加一个复核面「证伪上轮每条 P0/P1 的修复」；不重跑整份 diff 的对抗。
+- 每处修复要有可复现的红 → 绿证据（正向用例 + 至少一个越权 / 边界负向用例）；只靠自证式测试不算。
+- 修复后验证命令必须再跑一遍；`plausible_blocking` 未闭环不得通过。
 
-- **S1 路由清单**：所有 API 端点（多框架自动识别）
-- **S2 鉴权**：每个路由是否有鉴权标志（跨框架通用标志 + 项目 `.code-review.yml` 可追加）
-- **S3 SSRF**：接受 URL 参数的端点是否校验了目标地址（无配置时降级为 INFO 事实；配了 `ssrf_guard_functions` 则精确判断）
-- **S4 密钥**：硬编码的密钥/密码/Token（16 位以上字符串赋值）
-- **S5 跨存储删除**：删实体函数是否覆盖全部关联存储（通用锚点 + 项目 `.code-review.yml` 可追加）
-- **S6 裸 fetch**：前端直接 `fetch()` 调用（排除 auth client 封装和公开 URL）
-- **S7 错误吞没**：`except: pass` / `catch: return null` 不 raise
+## 7. 报告
 
-用法：`review-scan --root <项目目录> [--full] [--json] [--base <ref>]`
+报告含：结论；每条发现的最终状态与处置；系统性根因（仅 P0/P1）；未闭合项；skeptic 实际模型。MID / HIGH 落成文件，LOW 只在对话里给。所有数字必须来自工具输出。
 
-无 `review-scan` 时降级为 grep/opengrep 手动扫，但必须覆盖以上全部维度。
+## 8. 闭环
 
-输出格式：每条 finding 含 `id / project / subsystem / file / line / category / severity / evidence`。`route` 类标 INFO（供审查参考），其余标 P0-P2。
-
-**叠加 ocr 独立信号（非门禁）**：`ocr review`，用法见下方专节；其发现并入第 3 步四态判定，不自动确认。
-
-### 3. 阶段 B — 对抗审查
-**仅当有 actionable findings（非 INFO）时执行。** 分两轮：
-
-**Round 1 — Review agent**：逐条判断 4 状态：
-- `confirmed`：已读码确认，bug 真实存在
-- `plausible_blocking`：证据强但未 100% 确认，影响高
-- `refuted`：明确误报，有正面证据
-- `needs_repro`：需运行验证才能判定
-
-**Round 2 — Skeptic agent**：用**不同模型**质疑审查员，三视角缺一不可：
-1. **正确性 lens**：审查员的判断在代码逻辑上是否正确
-2. **可复现 lens**：这个问题能否被实际触发
-3. **攻击者 lens**：恶意用户怎么利用？（即使逻辑没坏，能怎么滥用）
-
-**关键规则**：
-- 默认从 `plausible_blocking` 起评，不直接 `refuted`
-- 只有拿出正面反驳证据才能转 `refuted`
-- `plausible_blocking` 不得因"证据不足"降级为 `refuted`
-- 如果审查员说 `refuted` 但攻击者能利用 → 升级
-
-### 4. 第一性原理根因升华
-对每条 `confirmed`/`plausible_blocking` 追问 4 问：
-1. **本质是什么**：剥离表象。"PUT 无鉴权"的本质不是"漏加了 Depends"，而是"鉴权无统一抽象，必然遗漏"
-2. **为什么出现**：底层原因（不是"开发者忘了"）
-3. **同类还有哪些**：同一根因的其他实例
-4. **系统性判断**：`isolated`（孤立失误）还是 `systemic`（系统性设计缺陷）
-
-对 `systemic` 的问题再做修复检查：
-- 治症状还是根因？
-- 隐含假设成立吗？
-- 覆盖所有同类情况吗？
-- 不治根因在哪复发？
-
-### 5. 修复 P0/P1
-- **必须先出方案、用户确认后再改**
-- 改完必须重新跑步骤 2+3
-- P0/P1 不修 = 不通过
-
-### 6. 重扫 + 验证（两个独立子步骤，缺一不可）
-
-#### 6a. 重扫（rescan）
-修完后重新跑步骤 2+3，确认：
-- 问题已消除
-- 无新引入的 P0/P1
-- 之前 plausible_blocking 的项已闭环
-
-#### 6b. 验证（verify）
-重扫通过后，必须跑项目验证命令，确认修复没有引入功能/构建/类型/运行时回归。
-
-命令：
-- 通用：`review-scan --root <项目目录> --verify`
-- 验证命令来自项目根目录 `.code-review.yml` 的 `verification.commands`；未配置时自动发现（pytest / mvn test / npm test / tsc 等）
-
-验证要求：
-- P0/P1 修复：必须跑对应验证命令；任何验证失败 = 不通过。
-- 涉及前端改动：至少跑 `tsc --noEmit` / `npm run build`。
-- 涉及后端改动：至少跑 pytest / mvn test / Python compileall。
-- P2 / 低风险：至少跑构建/类型验证。
-
-未配置验证命令且自动发现失败 → 标记为 INFO/needs_repro，不允许自动通过。
-只有 6a 和 6b 都通过，才能进入第 7 步报告。
-
-### 7. 报告
-产出审查报告，包含：
-- 结论（通过/不通过）
-- 每条 finding 的最终状态和处置
-- 升华出的系统性根因
-- 未闭合项（如有）
-
-### 8. 闭环判定
-- **通过**：零 P0/P1 + 零未解决 `plausible_blocking`
-- **不通过**：有未修复 P0/P1 或未解决 plausible_blocking
-- **不允许**：用"我改完了"代替验证——必须实际跑通重扫/重审/验证
-- **不允许**：跳过任何一步。不允许声称"完成了"除非流程以「通过」终止
+- **通过** = 零 P0/P1 + 零未解决 `plausible_blocking` + 验证全过；其余都是**不通过**。
+- 不允许用「我改完了」代替重扫和验证；未跑完不得声称完成。
+- 若项目装了提交门禁，凭据只在本档通过时写入，未跑完不得放行。不要手写哈希脚本绕过门禁。
 
 ## OCR 独立 finder（阿里 open-code-review，非门禁）
 
-> **定位**：独立信号 / 廉价第一遍，**不是门禁**。「通过/不通过」仍只由八步闭环判定；ocr 的发现一律作为待四态判定的输入，不自动确认——它召回率有意偏低（重精度轻噪音），**勿以"ocr 没报"当"没问题"**。
-
-**安装配置（一次性）**：
+> 只在 §5 的 HIGH 条件满足时跑。小 diff 上性价比为负（4 文件约 88 万 token）。
 
 ```bash
 npm install -g @alibaba-group/open-code-review   # 要求 Git ≥ 2.41
@@ -142,79 +92,25 @@ ocr config set provider deepseek
 ocr config set providers.deepseek.api_key "$DEEPSEEK_API_KEY"
 ```
 
-无 API key 的环境用 delegation 模式（`ocr delegate preview` / `ocr delegate rule`：ocr 只做文件选择+规则解析，审查由本 agent 以自身模型执行）。
+无 API key 时用 `ocr delegate preview` / `ocr delegate rule`：ocr 只做文件选择和规则解析，审查由本 agent 执行。
 
-**用法**（必须在 git 仓库目录内跑；多仓库工作区各仓库各跑一次，工作区根目录本身不是仓库）：
+必须在 git 仓库目录内跑；多仓库工作区各仓库各跑一次。先 `ocr review --preview` 看体量，再 `ocr review --format json --output .claude/ocr-findings.json --audience agent`。单提交用 `--commit <sha>`，区间用 `--from <base> --to <ref>`。severity 只是候选：critical→P0 / high→P1 / medium→P2 / low→P3，全部进 §4 判定。
 
-- 全流程（高危）：作为阶段 C 的独立 finder 之一，加 `--background "<业务上下文>"`；中危：阶段 A 后作第一遍
-- 快速扫描：`ocr review --preview` 先看范围控成本，再 `ocr review --format json --output .claude/ocr-findings.json --audience agent`
-- 单提交 `--commit <sha>`；区间 `--from <base> --to <ref>`；排除产物 `--exclude '**/generated/*,**/testdata/*'`
-- 输出映射：comment = `{path, content, start_line, end_line, category, severity, existing_code}`；severity→P 级**候选** critical→P0 / high→P1 / medium→P2 / low→P3，全部进第 3 步四态判定（`existing_code` 作 evidence）
+已知限制（2026-09-17 校准）：
 
-**已知坑**（2026-09-17 生产代码实测校准）：
+1. 对一组已知答案（1 个 P0、3 个 P1、1 个 P2）命中 0/5。只可叠加，不可替代。合并冲突仍以三方计数为准。
+2. 过审代码上零高/中危误报；同一问题可能重复上报，按 path + line 去重。
+3. 强项是跨文件交互。曾从 113 文件的合并里揪出生产在跑的心跳自杀 P0，多轮人工审查都漏了。
+4. Windows 下 `code_search failed` 是工具问题，不要中断审查。preset 钉死模型时用 `--model` 覆盖。大 diff 必须先 `--preview`（113 文件约 2600 万 token）。
 
-1. **召回偏低是设计**：对已知答案集（1 P0+3 P1+1 P2）命中 0/5——只可叠加、不可替代；**合并冲突审查仍以三方计数为准**（`git show merge^1/^2/merge:<file> | grep -c <关键语句>`）
-2. 噪音低：对四轮过审的代码仅 3 条 low、零高/中危误报（抽验 3/3 属实）；同一问题可能重复上报，汇总按 path+line 去重
-3. **强项=跨文件交互缺陷**：曾从 113 文件大合并里揪出生产在跑的心跳自杀 P0（两条各自过审的特性交互致任务误判死+成片丢失，多轮人工审查均漏掉）
-4. Windows 下日志见 `✘ code_search failed`（git grep 转义 bug）属工具问题，勿中断流程；preset 钉死 deepseek-flash，换模型用 `--model`；大 diff 必先 `--preview`（113 文件 ≈ 2600 万 token、92.8% 缓存读、约 5 分钟；4 文件 ≈ 88 万 token、约 1 分钟）
+## 例外（设计如此，标注原因，不降级为 refuted）
 
-## 跨模型对抗
-
-skeptic agent 必须用与 review agent **不同**的模型。当前可用模型：
-- `model: 'fable'` — glm-5.2（智谱）
-- 默认模型 — deepseek-v4-pro
-
-不同训练数据、不同架构 → 盲区不重叠 → 真正的对抗，而非同模型自审。
-
-## 例外规则识别
-
-审查时需主动识别以下设计如此（非 bug）的模式：
-- `<img>` 标签引用的图片路由（浏览器不发 Authorization 头）
-- `sendBeacon` 路由（不支持自定义请求头）
-- 登录注册入口（auth/captcha / auth/login / auth/register）
-- Webhook 入口（签名校验替代 JWT）
-- `/health` 健康检查
-- 早期/遗留子系统的已知弱鉴权现状（标注而非逐路由报 P0）
-
-遇到疑似例外时标注原因（如"webhook 入口，签名校验替代 JWT"），而非降级为 `refuted`。
+浏览器不能带自定义头的资源路由（如图片、`sendBeacon`；必须补替代控制：无鉴权且可枚举 = IDOR）；登录注册入口；Webhook（签名替代会话）；健康检查；已知的弱鉴权现状（标注，不逐路由报 P0）。
 
 ## 硬规则
 
-1. 不通过必须修复 P0/P1，修复后必须重新触发流程
-2. 只有零 P0/P1 且零 `plausible_blocking` 时才能给「通过」
-3. 不允许用"我改完了"代替验证——必须实际跑通重扫/重审/验证
-4. 不允许跳过任何一步。不允许声称"完成了"除非流程以「通过」终止
-5. 先出方案再改代码——口头"改吧"不能直接动手
-6. 有测量才给数字——所有计数必须来自工具输出
-7. **验证失败 = 不通过。不允许跳过构建/类型/测试验证。**
-
----
-
-## 提交门禁集成（review-gate）
-
-**目的**：`git commit` / `git push` / 部署命令（deploy、vercel、wrangler、terraform apply、kubectl apply/delete/patch、helm、docker push 等）执行前，PreToolUse 钩子 `~/.claude/hooks/review-gate.ps1` 会检查审查标记。无今日有效标记 → 命令被拦截，并提示先运行本流程。
-
-**标记写入规则（本 skill 必须遵守）**：
-
-1. **「通过」终止时**（第 8 步判定通过）：写入标记，使本轮审查成果可放行一次提交/推送/部署：
-   ```powershell
-   $g = Join-Path $env:USERPROFILE '.claude\review-gate'
-   $full = (Resolve-Path '.').Path.TrimEnd('\')
-   $sha = [System.Security.Cryptography.SHA256]::Create()
-   $b = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($full.ToLower()))
-   $sha.Dispose()
-   $h = -join ($b[0..7] | ForEach-Object { $_.ToString('x2') })
-   Set-Content -Path (Join-Path $g "$h.ok") -Value (Get-Date -Format 'yyyy-MM-dd') -NoNewline
-   ```
-2. **「不通过」终止时**：删除对应标记文件（存在则删）：
-   ```powershell
-   $g = Join-Path $env:USERPROFILE '.claude\review-gate'
-   $full = (Resolve-Path '.').Path.TrimEnd('\')
-   $sha = [System.Security.Cryptography.SHA256]::Create()
-   $b = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($full.ToLower()))
-   $sha.Dispose()
-   $h = -join ($b[0..7] | ForEach-Object { $_.ToString('x2') })
-   Remove-Item -Path (Join-Path $g "$h.ok") -Force -ErrorAction SilentlyContinue
-   ```
-3. 未跑完流程（中途终止）不得写标记；不得为绕过门禁编造或伪造标记。
-4. 标记有效期一天（仅当天放行）。放行后钩子自动将标记移入 `.stamp/`，新一轮提交需重新审查。
+1. 不通过必须修 P0/P1，修完重新审（只审增量，§6）。
+2. 零 P0/P1 且零未解决 `plausible_blocking`，验证全过，才能给「通过」。
+3. 验证失败 = 不通过，不允许跳过构建 / 类型 / 测试验证。
+4. 先出方案再改代码。
+5. 有测量才给数字。

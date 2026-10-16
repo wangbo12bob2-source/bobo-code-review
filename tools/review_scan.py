@@ -20,6 +20,7 @@ Usage:
   review-scan --selftest                            # self-contained fixture test
 """
 import argparse
+import ast
 import json
 import os
 import re
@@ -130,7 +131,10 @@ MANIFESTS = {
 
 # Risk level keywords
 RISK_HIGH = ["api/", "auth", "jwt", "/db", "db.py", "credit", "payment", "config",
-             "delete", "erase", "docker", "login", "permission"]
+             "delete", "erase", "docker", "login", "permission",
+             # billing, migrations, AI model / provider switches, authz, concurrency
+             "billing", "pricing", "quota", "refund", "migrat", ".sql",
+             "llm", "provider", "csrf", "rbac", "idempot"]
 RISK_MID = ["services/", "tasks/", "external", "review"]
 
 # ---------------------------------------------------------------------------
@@ -513,6 +517,123 @@ def _excluded(path, extra_exclude=None):
     return any(part in dirs for part in path.parts)
 
 
+# ---------------------------------------------------------------------------
+# Diff scope (2026-10-16): which findings are this change's business
+# ---------------------------------------------------------------------------
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_UNTRACKED_CAP = 300
+# Outside Python the only anchor is the reported line, so only categories whose hit sits on
+# one line (or just above its cause) are scoped; every other category keeps its severity.
+_SCOPED_LINE_LOCAL = {"route", "secret", "bare_fetch", "timestamp_trust", "error_swallow"}
+_NEIGHBOUR = 5
+
+
+def git_root(unit_root):
+    """Nearest directory at or above unit_root that has a .git (file or directory)."""
+    if (unit_root / ".git").exists():
+        return unit_root
+    for parent in unit_root.parents:
+        if (parent / ".git").exists():
+            return parent
+    return unit_root
+
+
+def untracked_files(git_dir):
+    """Untracked, non-ignored files (posix paths relative to git_dir).
+
+    Anything under a dot-directory (.wt-*, .claude/worktrees, .scratch) is skipped: a nested
+    worktree copy would flood the scan with duplicates of the whole repo. Past _UNTRACKED_CAP
+    files none are scanned, loudly -- a silent partial scan would be worse than no scan.
+    """
+    names = [n for n in git(git_dir, "-c", "core.quotepath=false", "ls-files",
+                            "--others", "--exclude-standard").splitlines()
+             if n and not any(part.startswith(".") for part in n.split("/")[:-1])]
+    if len(names) > _UNTRACKED_CAP:
+        print(f"[warn] {len(names)} untracked files (> {_UNTRACKED_CAP}) not scanned; "
+              f"gitignore the junk or `git add -N` the files under review", file=sys.stderr)
+        return []
+    return names
+
+
+def added_line_map(git_dir, base=None):
+    """{posix path relative to git_dir: touched line numbers (new side)} from one `git diff -U0`.
+
+    A pure-deletion hunk marks the two lines around the cut. Empty dict on any failure (repo
+    without HEAD, bad ref): callers must read that as "scope unknown" and keep every finding.
+    """
+    raw = git(git_dir, "-c", "core.quotepath=false", "diff", "-U0", "--no-color",
+              "--no-ext-diff", "--no-renames", base or "HEAD")
+    result, cur = {}, None
+    in_header = False
+    for line in raw.splitlines():
+        # '+++ ' is a file header only between 'diff --git' and the first hunk.
+        # An added source line that itself starts with '++ ' is emitted as '+++ …'
+        # and must not steal the hunks that follow it.
+        if line.startswith("diff --git "):
+            in_header = True
+            cur = None
+            continue
+        if in_header and line.startswith("+++ "):
+            tgt = line[4:].rstrip("\t")
+            cur = None if tgt == "/dev/null" else (tgt[2:] if tgt.startswith("b/") else tgt)
+            if cur is not None:
+                result.setdefault(cur, set())
+            continue
+        if line.startswith("@@"):
+            in_header = False
+        m = _HUNK_RE.match(line) if cur is not None else None
+        if m:
+            start = int(m.group(1))
+            count = 1 if m.group(2) is None else int(m.group(2))
+            result[cur].update(range(start, start + count) if count else (start, start + 1))
+    return result
+
+
+def _py_spans(lines):
+    """(start, end) of every def/class in a Python file (1-based, decorators included);
+    None when the source does not parse."""
+    try:
+        tree = ast.parse("\n".join(lines))
+    except (SyntaxError, ValueError):
+        return None
+    return [(min([n.lineno] + [d.lineno for d in n.decorator_list]), n.end_lineno)
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+
+
+def scope_findings(new_findings, path, rel, lines, added):
+    """Tag the findings one file produced with scope=diff|existing.
+
+    A finding is `diff` when an edit lands inside the code it is about: the innermost def/class
+    (Python), or the reported line and the _NEIGHBOUR lines below it (other languages, scoped
+    categories only). Every other finding becomes severity INFO with scope=existing; the
+    original severity moves to orig_severity, so nothing is lost -- it just stops costing review
+    time. Anything this cannot place (file not in the diff, unparsable source, unscoped
+    category) is left exactly as it was: the fail-safe direction is to keep.
+    """
+    touched = added.get(rel)
+    if not touched:
+        return
+    is_py = path.suffix.lower() == ".py"
+    spans = _py_spans(lines) if is_py else None
+    if is_py and spans is None:
+        return
+    for f in new_findings:
+        line = f.get("line")
+        if not line or not (is_py or f["category"] in _SCOPED_LINE_LOCAL):
+            continue
+        inner = [s for s in (spans or []) if s[0] <= line <= s[1]]
+        lo, hi = min(inner, key=lambda s: s[1] - s[0]) if inner else (line, line + _NEIGHBOUR)
+        if any(lo <= t <= hi for t in touched):
+            f["scope"] = "diff"
+        else:
+            f["scope"] = "existing"
+            if f["severity"] != "INFO":
+                f["orig_severity"] = f["severity"]
+                f["severity"] = "INFO"
+
+
 def discover_units(root):
     """Auto-discover project units by scanning for manifest files.
 
@@ -595,19 +716,14 @@ def changed_files(unit_root, base, full, extra_exclude=None):
             files.extend(unit_root.rglob(ext))
         return sorted({f for f in files if f.is_file() and not _excluded(f, extra_exclude)})
 
-    # Find git root for diff
-    git_dir = unit_root
-    if not (git_dir / ".git").exists():
-        for parent in unit_root.parents:
-            if (parent / ".git").exists():
-                git_dir = parent
-                break
+    git_dir = git_root(unit_root)
 
     if base:
         names = git(git_dir, "diff", "--name-only", base).splitlines()
     else:
         names = git(git_dir, "diff", "--name-only").splitlines()
         names += git(git_dir, "diff", "--staged", "--name-only").splitlines()
+    names += untracked_files(git_dir)
 
     out = []
     prefix = str(unit_root).replace("\\", "/")
@@ -1248,7 +1364,8 @@ def scan_one(path, subsystem, branch, unit_root, frameworks, auth_markers, cfg,
 # ---------------------------------------------------------------------------
 
 def risk_level(files):
-    paths = " ".join(str(f).lower() for f in files)
+    # either separator, repo-relative or absolute; the leading "/" lets "/db" and "api/" match at the root
+    paths = " ".join("/" + str(f).lower().replace("\\", "/").lstrip("/") for f in files)
     if any(k in paths for k in RISK_HIGH):
         return "HIGH"
     if any(k in paths for k in RISK_MID):
@@ -1271,16 +1388,19 @@ def print_summary(risk, total_files, ver_results=None):
               "unbounded_retry": "S8 OOM risk", "timestamp_trust": "S9 Timestamp trust"}
     for cat in ["auth", "ssrf", "secret", "cross_store_delete", "bare_fetch",
                 "error_swallow", "unbounded_retry", "timestamp_trust", "route"]:
-        items = by_cat.get(cat, [])
-        if not items:
-            continue
-        print(f"\n[{labels.get(cat, cat)}] {len(items)} findings")
-        for f in items[:15]:
-            sev = f["severity"]
-            print(f"  {f['id']} [{sev}] {f['subsystem']}/{f['file']}:{f['line']}")
-            print(f"       {f['evidence']}")
-        if len(items) > 15:
-            print(f"  ... {len(items) - 15} more (use --json for all)")
+        all_items = by_cat.get(cat, [])
+        items = [f for f in all_items if f.get("scope") != "existing"]
+        if items:
+            print(f"\n[{labels.get(cat, cat)}] {len(items)} findings")
+            for f in items[:15]:
+                sev = f["severity"]
+                print(f"  {f['id']} [{sev}] {f['subsystem']}/{f['file']}:{f['line']}")
+                print(f"       {f['evidence']}")
+            if len(items) > 15:
+                print(f"  ... {len(items) - 15} more (use --json for all)")
+        if len(all_items) > len(items):
+            print(f"\n[{labels.get(cat, cat)}] +{len(all_items) - len(items)} existing hits outside "
+                  f"the touched code (demoted to INFO, not judged; --json for details)")
 
     if ver_results is not None:
         print_verification_summary(ver_results)
@@ -1479,9 +1599,141 @@ def selftest():
         ], "HIGH", [tmpdir / "dummy.py"])
     check(not ver_passed2, "Verification runner: failing command fails")
 
-    # Cleanup
+    # --- Fixtures 15-: diff scope (risk on Windows paths, untracked files, finding scope) ---
+    def git_run(cwd, *a):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                       cwd=str(cwd), check=True, capture_output=True)
+
+    check(risk_level([r"proj\backend\api\assets.py"]) == "HIGH",
+          "risk_level: Windows backslash paths still match 'api/'")
+    check(risk_level(["web/src/components/Banner.tsx"]) == "LOW",
+          "risk_level: a plain UI path stays LOW")
+    check(risk_level(["db/models.py"]) == "HIGH" and risk_level([r"db\models.py"]) == "HIGH",
+          "risk_level: a top-level db/ directory matches '/db' with either separator")
+    check(risk_level(["backend/services/billing_service.py"]) == "HIGH"
+          and risk_level(["migrations/V30_add_column.sql"]) == "HIGH",
+          "risk_level: billing and migration paths are HIGH even under services/")
+
+    sc = tmpdir / "scoperepo"
+    (sc / "backend").mkdir(parents=True)
+    (sc / "web").mkdir()
+    swallow = "def {n}():\n    try:\n        work()\n    except Exception:\n        pass\n"
+    py_base = swallow.format(n="edited") + "\n" + swallow.format(n="untouched")
+    ts_fn = ('export async function {n}() {{\n  const r = await fetch("/api/{n}");\n'
+             '  return r;\n}}\n')
+    ts_base = ts_fn.format(n="edited") + "\n" + ts_fn.format(n="untouched")
+    (sc / "backend" / "svc.py").write_text(py_base, encoding="utf-8")
+    (sc / "backend" / "del.py").write_text("a = 1\nb = 2\nc = 3\nd = 4\ne = 5\n", encoding="utf-8")
+    (sc / "web" / "a.ts").write_text(ts_base, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(sc)], check=True, capture_output=True)
+    git_run(sc, "add", "-A")
+    git_run(sc, "commit", "-qm", "base")
+
+    # edits: svc.py line 3, del.py loses line 3, a.ts line 2 (the first fetch)
+    (sc / "backend" / "svc.py").write_text(py_base.replace("work()", "work(1)", 1), encoding="utf-8")
+    (sc / "backend" / "del.py").write_text("a = 1\nb = 2\nd = 4\ne = 5\n", encoding="utf-8")
+    (sc / "web" / "a.ts").write_text(ts_base.replace('"/api/edited"', '"/api/edited2"', 1),
+                                     encoding="utf-8")
+    (sc / "backend" / "fresh.py").write_text("x = 1\n", encoding="utf-8")
+    (sc / ".wt-copy").mkdir()
+    (sc / ".wt-copy" / "dup.py").write_text("y = 2\n", encoding="utf-8")
+
+    names = {p.relative_to(sc).as_posix() for p in changed_files(sc, None, False)}
+    check("backend/fresh.py" in names, "untracked new file is scanned in default mode")
+    check(".wt-copy/dup.py" not in names,
+          "files under dot-directories (nested worktree copies) are skipped")
+
+    capdir = tmpdir / "caprepo"
+    capdir.mkdir()
+    subprocess.run(["git", "init", "-q", str(capdir)], check=True, capture_output=True)
+    for i in range(4):
+        (capdir / f"n{i}.py").write_text("x = 1\n", encoding="utf-8")
+    import contextlib
+    import io
+    cap_was, warn = globals()["_UNTRACKED_CAP"], io.StringIO()
+    globals()["_UNTRACKED_CAP"] = 3
+    try:
+        with contextlib.redirect_stderr(warn):
+            flooded = untracked_files(capdir)
+    finally:
+        globals()["_UNTRACKED_CAP"] = cap_was
+    check(flooded == [] and "[warn]" in warn.getvalue(),
+          "untracked flood (> cap): scans none and warns on stderr, never a silent partial scan")
+
+    added = added_line_map(sc)
+    check(added.get("backend/svc.py") == {3}, "added_line_map: edited line -> touched set")
+    check(added.get("backend/del.py") == {2, 3},
+          "added_line_map: a pure deletion marks the lines around the cut")
+
+    plus = tmpdir / "plusrepo"
+    plus.mkdir()
+    (plus / "svc.py").write_text(
+        "def later():\n    try:\n        work()\n    except Exception:\n        pass\n",
+        encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(plus)], check=True, capture_output=True)
+    git_run(plus, "add", "-A")
+    git_run(plus, "commit", "-qm", "base")
+    (plus / "svc.py").write_text(
+        "++ note\ndef later():\n    try:\n        work(1)\n    except Exception:\n        pass\n",
+        encoding="utf-8")
+    plus_added = added_line_map(plus)
+    check(plus_added.get("svc.py") == {1, 4} and list(plus_added) == ["svc.py"],
+          "added_line_map: a source line starting with ++ does not steal later hunks")
+    check(added_line_map(tmpdir / "not-a-repo") == {},
+          "added_line_map: no repo -> empty dict (scope unknown, keep everything)")
+
+    svc = sc / "backend" / "svc.py"
+    _findings.clear()
+    scan_error_swallow(read_lines(svc), "t", "main", "backend/svc.py", ".py")
+    scope_findings(_findings, svc, "backend/svc.py", read_lines(svc), added)
+    by_line = {f["line"]: f for f in _findings}
+    check(by_line[4]["scope"] == "diff" and by_line[4]["severity"] == "P2",
+          "scope: a hit inside an edited function keeps its severity (scope=diff)")
+    check(by_line[10]["scope"] == "existing" and by_line[10]["severity"] == "INFO"
+          and by_line[10]["orig_severity"] == "P2",
+          "scope: a hit in an untouched function drops to INFO, original severity kept")
+
+    tsf = sc / "web" / "a.ts"
+    _findings.clear()
+    scan_bare_fetch(read_lines(tsf), "t", "main", "web/a.ts", {})
+    scope_findings(_findings, tsf, "web/a.ts", read_lines(tsf), added)
+    by_line = {f["line"]: f for f in _findings}
+    check(by_line[2]["scope"] == "diff", "scope (non-Python): the edited line's hit is diff")
+    check(by_line[7]["scope"] == "existing",
+          "scope (non-Python): a hit far from every edit is existing")
+
+    _findings.clear()
+    scan_error_swallow(read_lines(svc), "t", "main", "backend/svc.py", ".py")
+    scope_findings(_findings, svc, "backend/other.py", read_lines(svc), added)
+    check(_findings and all("scope" not in f for f in _findings),
+          "scope: a file missing from the diff map is left untouched (fail-safe keep)")
+
+    broken = ["def f(:", "    try:", "        x()", "    except Exception:", "        pass"]
+    _findings.clear()
+    scan_error_swallow(broken, "t", "main", "b.py", ".py")
+    scope_findings(_findings, Path("b.py"), "b.py", broken, {"b.py": {1}})
+    check(_findings and "scope" not in _findings[0],
+          "scope: unparsable Python is left untouched (fail-safe keep)")
+
+    run = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--root", str(sc), "--json"],
+                         capture_output=True, text=True, encoding="utf-8")
+    out = json.loads(run.stdout)
+    hits = {(f["file"], f["line"]): f for f in out["findings"] if f["category"] == "error_swallow"}
+    check(hits[("backend/svc.py", 4)]["scope"] == "diff"
+          and hits[("backend/svc.py", 10)]["scope"] == "existing",
+          "end-to-end: --json carries scope on every finding")
+    check(out["file_count"] == 4,
+          "end-to-end: three tracked edits plus the untracked file are all scanned")
+    run2 = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--root", str(sc),
+                           "--json", "--actionable"], capture_output=True, text=True, encoding="utf-8")
+    out2 = json.loads(run2.stdout)
+    check(out2["findings"] and all(f["severity"] != "INFO" for f in out2["findings"])
+          and any(f["severity"] == "INFO" for f in out["findings"]),
+          "end-to-end: --actionable drops INFO findings, plain --json keeps them")
+
+    # Cleanup (git object files are read-only on Windows, so clear the bit before removing)
     import shutil
-    shutil.rmtree(tmpdir, ignore_errors=True)
+    shutil.rmtree(tmpdir, onerror=lambda fn, p, _e: (os.chmod(p, 0o700), fn(p)))
 
     print(f"\nselftest {'all passed' if ok else 'HAS FAILURES'}")
     return 0 if ok else 1
@@ -1501,6 +1753,8 @@ def main():
                     help="Full scan (default: scan git uncommitted changes)")
     ap.add_argument("--base", help="Diff against specified base ref")
     ap.add_argument("--json", action="store_true", help="JSON output")
+    ap.add_argument("--actionable", action="store_true",
+                    help="With --json: drop INFO findings (routes, and hits demoted as existing)")
     ap.add_argument("--verify", action="store_true",
                     help="Run verification commands after scan (from .code-review.yml)")
     args = ap.parse_args()
@@ -1522,6 +1776,7 @@ def main():
     units = discover_units(root)
 
     all_files = []
+    risk_paths = []
     for unit_name, unit_root, langs in units:
         branch = get_branch(unit_root)
         frameworks = detect_frameworks(unit_root, langs)
@@ -1532,6 +1787,9 @@ def main():
             print(f"[{unit_name}] No uncommitted changes (use --full for full scan, "
                   f"--base <ref> for diff against base)", file=sys.stderr)
         all_files.extend(files)
+        git_dir = git_root(unit_root)
+        risk_paths.extend(f.relative_to(git_dir).as_posix() for f in files)
+        added = {} if args.full else added_line_map(git_dir, args.base)
 
         # Unit-level checks
         check_unit_auth(unit_name, unit_root, branch, auth_markers)
@@ -1541,10 +1799,14 @@ def main():
         # Per-file scanning
         report_auth = unit_has_auth(unit_root, auth_markers)  # suppress per-route if whole unit has no auth
         for path in files:
+            n0 = len(_findings)
             scan_one(path, unit_name, branch, unit_root, frameworks,
                      auth_markers, cfg, report_auth=report_auth)
+            if added and len(_findings) > n0:
+                scope_findings(_findings[n0:], path, path.relative_to(git_dir).as_posix(),
+                               read_lines(path), added)
 
-    risk = risk_level(all_files)
+    risk = risk_level(risk_paths)
 
     # Verification (if --verify)
     ver_results = None
@@ -1569,7 +1831,8 @@ def main():
 
     if args.json:
         output = {"risk": risk, "file_count": len(all_files),
-                  "findings": _findings}
+                  "findings": [f for f in _findings if f["severity"] != "INFO"]
+                  if args.actionable else _findings}
         if ver_results is not None:
             output["verification"] = {"passed": ver_passed, "results": ver_results}
         print(json.dumps(output, ensure_ascii=False, indent=2))
