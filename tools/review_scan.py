@@ -6,8 +6,8 @@ review_scan.py — Universal deterministic code review scanner.
 Outputs a FACT list (facts, not judgments). Zero model, zero hallucination, reproducible.
 
 Auto-discovers project structure from --root (default CWD) by finding manifest files
-(package.json / requirements.txt / go.mod / pom.xml / Cargo.toml etc.), then scans all
-source files across 5 languages (Python / JS-TS / Java / Go / Rust) for 7 dimensions.
+(package.json / requirements.txt / go.mod / pubspec.yaml / pom.xml / Cargo.toml),
+then scans source files in Python, JS/TS, Java, Go, Dart and Rust.
 
 Supports optional .code-review.yml per-project overlay for project-specific precision
 (auth markers, SSRF guard functions, delete anchors, fetch impl files, etc.).
@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from itertools import islice
 from pathlib import Path
 
 # Windows console default GBK; force UTF-8
@@ -92,6 +93,9 @@ SECRET_RE = re.compile(
     r"""(api_key|apikey|secret|password|access_key|secret_key|token|ak|sk)
         \s*=\s*['"]([A-Za-z0-9_\-]{16,})['"]""",
     re.IGNORECASE | re.VERBOSE)
+GO_SECRET_RE = re.compile(
+    r'\b(api_key|apikey|secret|password|access_key|secret_key|token|ak|sk)'
+    r'(?:\s+string)?\s*:?=\s*["\x60]([A-Za-z0-9_-]{16,})["\x60]', re.I)
 GETENV_RE = re.compile(r"os\.getenv|os\.environ|config\(|Config\(|process\.env\.")
 
 # Placeholder blacklist (historical hardcoded defaults)
@@ -105,13 +109,13 @@ EXCLUDE_DIRS = {
     "node_modules", ".venv", "venv", "env", "__pycache__", "dist", "build",
     ".git", ".next", ".nuxt", "out", "target", ".idea", ".vscode", "vendor",
     ".gradle", ".m2", ".terraform", ".serverless", ".pytest_cache", ".mypy_cache",
-    "coverage", ".cache", "binlog2sql", "bin",
+    "coverage", ".cache", ".dart_tool", "binlog2sql",
 }
 
 # Source file extensions
 SRC_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-    ".java", ".go", ".rs",
+    ".java", ".go", ".dart", ".rs",
     ".yml", ".yaml",
 }
 
@@ -123,6 +127,7 @@ MANIFESTS = {
     "setup.py": "python",
     "Pipfile": "python",
     "go.mod": "go",
+    "pubspec.yaml": "dart",
     "pom.xml": "java",
     "build.gradle": "java",
     "build.gradle.kts": "java",
@@ -158,12 +163,6 @@ ROUTE_PATTERNS = {
         r"router\.(?:get|post|put|delete|patch)\(\s*['\"]([^'\"]+)['\"]"),
     "spring": re.compile(
         r"@(Get|Post|Put|Delete|Patch|Request)Mapping\(\s*(?:value\s*=\s*)?['\"]([^'\"]*)['\"]"),
-    "gin": re.compile(
-        r"\.(?:GET|POST|PUT|DELETE|PATCH|Handle|Any)\(\s*['\"]([^'\"]+)['\"]"),
-    "echo": re.compile(
-        r"\.(?:GET|POST|PUT|DELETE|PATCH)\(\s*['\"]([^'\"]+)['\"]"),
-    "net_http": re.compile(
-        r"(?:http|mux)\.(?:HandleFunc|Handle)\(\s*['\"]([^'\"]+)['\"]"),
     "axum": re.compile(
         r"\.route\(\s*['\"]([^'\"]+)['\"]"),
     "actix": re.compile(
@@ -179,8 +178,8 @@ FRAMEWORK_DETECT = {
     "nestjs": [r"@Controller", r"@Module", r"from ['\"]@nestjs"],
     "koa": [r"from ['\"]koa['\"]", r"require\(['\"]koa['\"]\)"],
     "spring": [r"@(Get|Post|Put|Delete|Request)Mapping", r"org\.springframework"],
-    "gin": [r'"github\.com/gin-gonic/gin"', r"gin\.(Default|New)"],
-    "echo": [r'"github\.com/labstack/echo', r"echo\.(New|NewWithContext)"],
+    "gin": [r'github\.com/gin-gonic/gin\b', r"gin\.(Default|New)"],
+    "echo": [r'github\.com/labstack/echo\b', r"echo\.(New|NewWithContext)"],
     "net_http": [r'"net/http"', r"http\.HandleFunc", r"http\.Handle"],
     "axum": [r"axum::", r"Router::new"],
     "actix": [r"actix_web::", r"actix::", r"#\[get\(", r"#\[post\("],
@@ -353,6 +352,18 @@ def discover_default_verification(unit_root, langs):
             "on_risk": ["HIGH", "MID", "LOW"],
         })
 
+    if "go" in langs:
+        for command in ("go test ./...", "go vet ./..."):
+            commands.append({"name": command, "run": command, "cwd": "."})
+
+    if "dart" in langs:
+        sdk = "flutter" if is_flutter_project(root) else "dart"
+        command = f"{sdk} analyze"
+        commands.append({"name": command, "run": command, "cwd": "."})
+        if any((root / "test").rglob("*_test.dart")):
+            command = f"{sdk} test"
+            commands.append({"name": command, "run": command, "cwd": "."})
+
     # Java
     if "java" in langs:
         if (root / "pom.xml").is_file():
@@ -514,7 +525,9 @@ def _excluded(path, extra_exclude=None):
     dirs = EXCLUDE_DIRS
     if extra_exclude:
         dirs = dirs | extra_exclude
-    return any(part in dirs for part in path.parts)
+    # bin/ normally holds build output, but is the source entry point for Dart CLIs.
+    return any(part in dirs for part in path.parts) or (
+        "bin" in path.parts and path.suffix.lower() != ".dart")
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +647,13 @@ def scope_findings(new_findings, path, rel, lines, added):
                 f["severity"] = "INFO"
 
 
+def is_flutter_project(root):
+    """Recognize the Flutter SDK dependency or a top-level Flutter config section."""
+    pubspec = "\n".join(read_lines(root / "pubspec.yaml"))
+    pubspec = re.sub(r"(?m)\s*#[^\n]*$", "", pubspec)
+    return bool(re.search(r"(?m)^flutter\s*:|\bsdk\s*:\s*['\"]?flutter\b", pubspec))
+
+
 def discover_units(root):
     """Auto-discover project units by scanning for manifest files.
 
@@ -642,11 +662,18 @@ def discover_units(root):
     """
     root = Path(root).resolve()
     units = {}  # dir_path -> (name, set of languages)
+    flutter_android_roots = set()
     for manifest, lang in MANIFESTS.items():
-        for p in root.rglob(manifest):
+        for p in sorted(root.rglob(manifest)):
             if _excluded(p):
                 continue
             d = p.parent
+            if lang == "dart" and is_flutter_project(d):
+                flutter_android_roots.add(d / "android")
+            if manifest.startswith("build.gradle") and any(
+                host == d or host in d.parents for host in flutter_android_roots
+            ):
+                continue
             if d not in units:
                 units[d] = (d.name, set())
             units[d][1].add(lang)
@@ -658,25 +685,20 @@ def discover_units(root):
     return [(name, d, langs) for d, (name, langs) in units.items()]
 
 
-def detect_frameworks(unit_root, langs):
+def detect_frameworks(unit_root):
     """Detect web frameworks by scanning source files for import/decorator patterns.
 
-    Returns set of framework names (keys of ROUTE_PATTERNS).
+    Returns set of known web framework names.
     """
     detected = set()
     # Sample files (limit to avoid scanning everything just for detection)
     sample_files = []
     for ext in (".py", ".js", ".ts", ".java", ".go", ".rs"):
-        for p in unit_root.rglob(f"*{ext}"):
-            if _excluded(p):
-                continue
-            sample_files.append(p)
-            if len(sample_files) >= 50:
-                break
-        if len(sample_files) >= 50:
-            break
+        # A large Python or JS project must not exhaust the Go framework sample.
+        candidates = (p for p in unit_root.rglob(f"*{ext}") if not _excluded(p))
+        sample_files.extend(islice(candidates, 50))
 
-    all_text = ""
+    all_text = "\n".join(read_lines(unit_root / "go.mod")) + "\n"
     for p in sample_files:
         try:
             all_text += p.read_text(encoding="utf-8", errors="replace") + "\n"
@@ -689,7 +711,6 @@ def detect_frameworks(unit_root, langs):
                 detected.add(fw)
                 break
 
-    # Language hint: if langs has 'python' but no python framework detected, still scan py
     return detected
 
 
@@ -711,8 +732,7 @@ def changed_files(unit_root, base, full, extra_exclude=None):
     """Return list of files to scan (absolute paths)."""
     if full:
         files = []
-        for ext in ("*.py", "*.java", "*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs",
-                    "*.go", "*.rs", "*.yml", "*.yaml", ".env.example", "*.env.example"):
+        for ext in [f"*{ext}" for ext in sorted(SRC_EXTENSIONS)] + ["*.env.example"]:
             files.extend(unit_root.rglob(ext))
         return sorted({f for f in files if f.is_file() and not _excluded(f, extra_exclude)})
 
@@ -726,11 +746,10 @@ def changed_files(unit_root, base, full, extra_exclude=None):
     names += untracked_files(git_dir)
 
     out = []
-    prefix = str(unit_root).replace("\\", "/")
     for n in dict.fromkeys(names):
         p = git_dir / n
         # Only include files under this unit root
-        if not str(p).replace("\\", "/").startswith(prefix):
+        if unit_root not in p.parents:
             continue
         if p.is_file() and not _excluded(p, extra_exclude):
             out.append(p)
@@ -930,24 +949,50 @@ def scan_routes_java(lines, subsystem, branch, rel, frameworks, auth_markers):
                 severity="P2")  # P2 because Spring auth is usually centralized
 
 
-def scan_routes_go(lines, subsystem, branch, rel, frameworks, auth_markers):
-    """S1+S2 for Go (gin, echo, net/http)."""
-    for fw in ("gin", "echo", "net_http"):
-        if fw not in frameworks:
-            continue
-        route_re = ROUTE_PATTERNS.get(fw)
-        if not route_re:
-            continue
-        for idx, ln in enumerate(lines, 1):
-            m = route_re.search(ln)
-            if not m:
+GO_HTTP_ROUTE_RE = re.compile(
+    r'\b(\w+)\.(HandleFunc|Handle)\s*\(\s*["\x60]([^"\x60\n]+)["\x60]\s*,')
+GO_SERVE_MUX_RE = re.compile(r"\b(\w+)\s*:?=\s*http\.NewServeMux\s*\(")
+GO_FRAMEWORK_ROUTE_RE = re.compile(
+    r'\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE|Any)\s*\(\s*'
+    r'["\x60](/[^"\x60\n]*)["\x60]\s*,'
+    r'|\.(Handle|Add)\s*\(\s*(?:http\.Method(\w+)|"([A-Z]+)")\s*,\s*'
+    r'["\x60](/[^"\x60\n]*)["\x60]\s*,')
+
+
+def scan_routes_go(source, subsystem, branch, rel, frameworks):
+    """S1: Inventory literal registrations in gin, Echo and net/http."""
+    matches = []
+    code = mask_source(source)
+    if "net_http" in frameworks:
+        receivers = {"http", "mux"} | set(GO_SERVE_MUX_RE.findall(code))
+        for match in GO_HTTP_ROUTE_RE.finditer(source):
+            receiver, method, path = match.groups()
+            if receiver not in receivers or not code.startswith(receiver + ".", match.start()):
                 continue
-            path = m.group(1)
-            # Extract method
-            method_m = re.search(r"\.(GET|POST|PUT|DELETE|PATCH|HandleFunc|Handle)\(", ln)
-            method = method_m.group(1) if method_m else "ANY"
-            add("", subsystem, branch, rel, idx, "route",
-                f"[{fw}] {method} {path}", severity="INFO")
+            # Go 1.22 ServeMux accepts patterns such as "GET /users/{id}".
+            if " " in path:
+                method, path = path.split(" ", 1)
+            matches.append((match.start(), "net_http", method, path))
+    web_frameworks = frameworks & {"gin", "echo"}
+    if web_frameworks:
+        local = {fw for fw in web_frameworks
+                 if any(re.search(pat, source) for pat in FRAMEWORK_DETECT[fw])}
+        label = "/".join(sorted(local or web_frameworks))
+        for match in GO_FRAMEWORK_ROUTE_RE.finditer(source):
+            if code[match.start()] != ".":
+                continue
+            method, path, register, method_const, method_literal, other_path = match.groups()
+            if register:
+                framework = "gin" if register == "Handle" else "echo"
+                if framework in web_frameworks:
+                    method = method_literal or method_const.upper()
+                    matches.append((match.start(), framework, method, other_path))
+            else:
+                matches.append((match.start(), label, method, path))
+
+    for offset, framework, method, path in sorted(matches):
+        add("", subsystem, branch, rel, source.count("\n", 0, offset) + 1, "route",
+            f"[{framework}] {method} {path}", severity="INFO")
 
 
 def scan_routes_rust(lines, subsystem, branch, rel, frameworks, auth_markers):
@@ -1045,6 +1090,7 @@ def check_unit_ssrf(subsystem, unit_root, branch, cfg):
 
 def scan_secrets(lines, subsystem, branch, rel):
     """S4: Detect hardcoded secrets/keys (16+ char string assignments)."""
+    pattern = GO_SECRET_RE if rel.lower().endswith(".go") else SECRET_RE
     for idx, ln in enumerate(lines, 1):
         # Placeholder blacklist
         for ph in SECRET_PLACEHOLDERS:
@@ -1055,7 +1101,7 @@ def scan_secrets(lines, subsystem, branch, rel):
         # Skip env/config reads
         if GETENV_RE.search(ln):
             continue
-        m = SECRET_RE.search(ln)
+        m = pattern.search(ln)
         if m:
             add("", subsystem, branch, rel, idx, "secret",
                 f"Suspected hardcoded secret: {m.group(1)}={m.group(2)[:8]}...(len={len(m.group(2))})",
@@ -1188,10 +1234,6 @@ def scan_error_swallow(lines, subsystem, branch, rel, ext):
                     f"(masks failure, upstream misjudges success)",
                     severity="P2")
 
-    elif ext in (".go", ".java", ".rs"):
-        # MVP: not covered, report INFO if we see catch/except patterns
-        pass  # Future: add Go/Java/Rust error swallow detection
-
 # ---------------------------------------------------------------------------
 # S8: Unbounded retry / OOM risk (Python)
 # ---------------------------------------------------------------------------
@@ -1287,12 +1329,69 @@ def check_unit_auth(subsystem, unit_root, branch, auth_markers):
         f"(not flagging per-route P0)",
         severity="P1", status="plausible_blocking")
 
+# Preserve newlines and offsets so multiline matches report source line numbers.
+C_STYLE_TOKENS = re.compile(
+    r'//[^\n]*|/\*[\s\S]*?\*/|"""[\s\S]*?"""|\x27{3}[\s\S]*?\x27{3}'
+    r'|\x60[^\x60]*\x60|"(?:\\.|[^"\\\n])*"|\x27(?:\\.|[^\x27\\\n])*\x27')
+GO_EMPTY_ERROR_RE = re.compile(
+    r'\bif\s+(?:[^{};\n]+;\s*)?(\w+)\s*!=\s*nil\s*\{\s*\}')
+GO_ERROR_NAME_RE = re.compile(r"^(?:err|error)$|^err(?:_|[A-Z])|(?:Err|Error|_err|_error)$")
+DART_EMPTY_CATCH_RE = re.compile(
+    r'\b(?:on\s+[\w.]+(?:\s+catch\s*\([^)]*\))?|catch\s*\([^)]*\))'
+    r'\s*\{\s*(?:return(?:\s+null)?\s*;\s*)?\}')
+DART_HTTP_IMPORT_RE = re.compile(
+    r"""\bimport\s+['"]package:http/http\.dart['"]\s*(?:as\s+(\w+)\s*)?;""")
+DART_HTTP_METHODS = r"get|post|put|patch|delete|head|read|readBytes"
+
+
+def mask_source(source, keep_strings=False):
+    def mask(match):
+        token = match.group()
+        if token.startswith(("//", "/*")):
+            return re.sub(r"[^\n]", " ", token)
+        if keep_strings:
+            return token
+        # A placeholder keeps a string literal from turning into syntactic whitespace.
+        return re.sub(r"[^\n]", "_", token)
+
+    return C_STYLE_TOKENS.sub(mask, source)
+
+
+def scan_go_errors(source, subsystem, branch, rel):
+    for match in GO_EMPTY_ERROR_RE.finditer(source):
+        name = match.group(1)
+        if GO_ERROR_NAME_RE.search(name):
+            add("", subsystem, branch, rel, source.count("\n", 0, match.start()) + 1,
+                "error_swallow", f"Go error branch is empty: if {name} != nil", severity="P2")
+
+
+def scan_dart(source, subsystem, branch, rel, cfg):
+    code = mask_source(source)
+    for match in DART_EMPTY_CATCH_RE.finditer(code):
+        add("", subsystem, branch, rel, code.count("\n", 0, match.start()) + 1,
+            "error_swallow", "Dart exception handler is empty or returns without reporting the error",
+            severity="P2")
+
+    if any(rel.lower() == path or rel.lower().endswith("/" + path)
+           for path in get_fetch_impl_files(cfg)):
+        return
+    for match in DART_HTTP_IMPORT_RE.finditer(source):
+        if not code.startswith("import", match.start()):
+            continue
+        alias = match.group(1)
+        prefix = rf"\b{re.escape(alias)}\s*\.\s*" if alias else r"(?<![.\w])"
+        calls = re.compile(rf"{prefix}({DART_HTTP_METHODS})\s*\(")
+        for call in calls.finditer(code):
+            add("", subsystem, branch, rel, code.count("\n", 0, call.start()) + 1,
+                "bare_fetch", f"Direct package:http call ({call.group(1)}); check shared client handling",
+                severity="P2")
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher: scan one file
 # ---------------------------------------------------------------------------
 
-def scan_one(path, subsystem, branch, unit_root, frameworks, auth_markers, cfg,
-             report_auth=True):
+def scan_one(path, subsystem, branch, unit_root, frameworks, auth_markers, cfg):
     """Dispatch file to appropriate scanners based on extension."""
     rel = str(path.relative_to(unit_root)).replace("\\", "/")
     lines = read_lines(path)
@@ -1342,11 +1441,18 @@ def scan_one(path, subsystem, branch, unit_root, frameworks, auth_markers, cfg,
         scan_secrets(lines, subsystem, branch, rel)
 
     elif ext == ".go":
-        # S1 routes (gin/echo/net_http)
-        if frameworks:
-            scan_routes_go(lines, subsystem, branch, rel, frameworks, auth_markers)
-        # S4 secrets
-        scan_secrets(lines, subsystem, branch, rel)
+        source = "\n".join(lines)
+        uncommented = mask_source(source, keep_strings=True)
+        if frameworks & {"gin", "echo", "net_http"}:
+            scan_routes_go(uncommented, subsystem, branch, rel, frameworks)
+        scan_secrets(uncommented.split("\n"), subsystem, branch, rel)
+        scan_go_errors(mask_source(source), subsystem, branch, rel)
+
+    elif ext == ".dart":
+        source = "\n".join(lines)
+        uncommented = mask_source(source, keep_strings=True)
+        scan_secrets(uncommented.split("\n"), subsystem, branch, rel)
+        scan_dart(uncommented, subsystem, branch, rel, cfg)
 
     elif ext == ".rs":
         # S1 routes (axum/actix)
@@ -1552,7 +1658,7 @@ def selftest():
         '}\n'
     , encoding="utf-8")
     _findings.clear()
-    scan_routes_go(read_lines(f10), "test", "main", "main.go", {"gin"}, auth_markers)
+    scan_routes_go(f10.read_text(encoding="utf-8"), "test", "main", "main.go", {"gin"})
     has_gin_route = any(f["category"] == "route" and "[gin]" in f["evidence"] for f in _findings)
     check(has_gin_route, "S1 detects gin routes")
 
@@ -1580,7 +1686,7 @@ def selftest():
     check(has_multi_unit, "Phase 0 discovers project units from manifests")
 
     # --- Fixture 13: Framework detection ---
-    detected = detect_frameworks(proj, {"python", "js"})
+    detected = detect_frameworks(proj)
     # The project has package.json + requirements.txt but no source files with imports
     # So framework detection may return empty — that's OK, just verify it doesn't crash
     check(True, "Framework detection runs without error (may return empty for fixture)")
@@ -1731,6 +1837,65 @@ def selftest():
           and any(f["severity"] == "INFO" for f in out["findings"]),
           "end-to-end: --actionable drops INFO findings, plain --json keeps them")
 
+    # Go and Flutter/Dart exercise the CLI dispatcher and nested project discovery.
+    mixed = tmpdir / "mixed"
+    (mixed / "mobile" / "android" / "app").mkdir(parents=True)
+    (mixed / "mobile" / ".dart_tool").mkdir()
+    (mixed / "mobile" / "test").mkdir()
+    (mixed / "cli" / "bin").mkdir(parents=True)
+    (mixed / "go.mod").write_text(
+        "module example.com/test\nrequire github.com/gin-gonic/gin v1.10.0\n", encoding="utf-8")
+    (mixed / "mobile" / "pubspec.yaml").write_text(
+        "dependencies:\n  flutter:\n    sdk: flutter\n", encoding="utf-8")
+    (mixed / "mobile" / "android" / "app" / "build.gradle.kts").touch()
+    (mixed / "mobile" / "test" / "widget_test.dart").touch()
+    (mixed / "mobile" / ".dart_tool" / "generated.dart").touch()
+    (mixed / "cli" / "pubspec.yaml").write_text("name: cli\n", encoding="utf-8")
+    (mixed / "cli" / "bin" / "cli.dart").write_text("void main() {}\n", encoding="utf-8")
+
+    commands = {
+        unit_root.relative_to(mixed).as_posix():
+            [cmd["run"] for cmd in discover_default_verification(unit_root, langs)]
+        for _, unit_root, langs in discover_units(mixed)
+    }
+    check(commands == {
+        ".": ["go test ./...", "go vet ./..."],
+        "mobile": ["flutter analyze", "flutter test"],
+        "cli": ["dart analyze"],
+    }, "Go, Flutter and Dart select their own verification commands, excluding the Android host")
+
+    subprocess.run(["git", "init", "-q", str(mixed)], check=True, capture_output=True)
+    (mixed / "server.go").write_text(
+        'package fixture\nimport "net/http"\nfunc routes() {\n'
+        '  server := http.NewServeMux()\n'
+        '  server.HandleFunc("GET /users/{id}", handler)\n'
+        '  r.OPTIONS(\n    "/items", handler,\n  )\n'
+        '  if err := work(); err != nil { /* ignored */ }\n'
+        '  if err := work(); err != nil { log(err) }\n'
+        '  token := `fakeFixtureToken99`\n'
+        '  // if err != nil {}\n'
+        '  r.Use(AuthMiddleware())\n}\n', encoding="utf-8")
+    (mixed / "mobile" / "loader.dart").write_text(
+        "import 'package:http/http.dart' as api;\n"
+        "void load() {\n"
+        "  try { api.get(uri); } catch (_) { /* ignored */ }\n"
+        "  try { work(); } on Exception { rethrow; }\n"
+        "  // try { work(); } catch (_) {}\n"
+        "}\n", encoding="utf-8")
+    for mode, full_flag in (("default", []), ("full", ["--full"])):
+        run = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--root", str(mixed),
+                              "--json", *full_flag], capture_output=True, text=True, encoding="utf-8")
+        output = json.loads(run.stdout)
+        hits = [(f["file"], f["line"], f["category"]) for f in output["findings"]]
+        check(sorted(hits) == sorted([
+            ("server.go", 5, "route"), ("server.go", 6, "route"),
+            ("server.go", 9, "error_swallow"), ("server.go", 11, "secret"),
+            ("loader.dart", 3, "error_swallow"), ("loader.dart", 3, "bare_fetch"),
+        ]), f"Go and Dart findings occur once on the right lines in {mode} mode")
+    check((mixed / "cli" / "bin" / "cli.dart") in changed_files(mixed, None, True)
+          and (mixed / "mobile" / ".dart_tool" / "generated.dart") not in changed_files(mixed, None, True),
+          "Dart CLI sources are included and Flutter tool output is excluded")
+
     # Cleanup (git object files are read-only on Windows, so clear the bit before removing)
     import shutil
     shutil.rmtree(tmpdir, onerror=lambda fn, p, _e: (os.chmod(p, 0o700), fn(p)))
@@ -1777,12 +1942,16 @@ def main():
 
     all_files = []
     risk_paths = []
-    for unit_name, unit_root, langs in units:
+    # Scan files belonging to nested projects once, using their closest manifest.
+    seen_files = set()
+    for unit_name, unit_root, langs in sorted(units, key=lambda unit: -len(unit[1].parts)):
         branch = get_branch(unit_root)
-        frameworks = detect_frameworks(unit_root, langs)
+        frameworks = detect_frameworks(unit_root)
 
         # Get files to scan
         files = changed_files(unit_root, args.base, args.full, extra_exclude)
+        files = [path for path in files if path not in seen_files]
+        seen_files.update(files)
         if not files and not args.full:
             print(f"[{unit_name}] No uncommitted changes (use --full for full scan, "
                   f"--base <ref> for diff against base)", file=sys.stderr)
@@ -1792,19 +1961,26 @@ def main():
         added = {} if args.full else added_line_map(git_dir, args.base)
 
         # Unit-level checks
-        check_unit_auth(unit_name, unit_root, branch, auth_markers)
-        if get_ssrf_guard_functions(cfg):
-            check_unit_ssrf(unit_name, unit_root, branch, cfg)
+        extensions = {path.suffix.lower() for path in files} & SRC_EXTENSIONS
+        source_extensions = extensions - {".yaml", ".yml"}
+        go_or_dart_only = bool(langs and langs <= {"go", "dart"}) or (
+            not langs and bool(source_extensions) and source_extensions <= {".go", ".dart"})
+        if not go_or_dart_only:
+            check_unit_auth(unit_name, unit_root, branch, auth_markers)
+            if get_ssrf_guard_functions(cfg):
+                check_unit_ssrf(unit_name, unit_root, branch, cfg)
 
         # Per-file scanning
-        report_auth = unit_has_auth(unit_root, auth_markers)  # suppress per-route if whole unit has no auth
+        unit_start = len(_findings)
         for path in files:
             n0 = len(_findings)
-            scan_one(path, unit_name, branch, unit_root, frameworks,
-                     auth_markers, cfg, report_auth=report_auth)
+            scan_one(path, unit_name, branch, unit_root, frameworks, auth_markers, cfg)
             if added and len(_findings) > n0:
                 scope_findings(_findings[n0:], path, path.relative_to(git_dir).as_posix(),
                                read_lines(path), added)
+
+        if go_or_dart_only and any(f["category"] == "route" for f in _findings[unit_start:]):
+            check_unit_auth(unit_name, unit_root, branch, auth_markers)
 
     risk = risk_level(risk_paths)
 
@@ -1813,21 +1989,22 @@ def main():
     ver_passed = True
     if args.verify:
         ver_cmds = get_verification_commands(cfg)
-        if not ver_cmds:
-            # Auto-discover default commands
-            for unit_name, unit_root, langs in units:
-                ver_cmds = discover_default_verification(unit_root, langs)
-                if ver_cmds:
-                    break
         if ver_cmds:
-            # Use first unit's root for verification
-            first_unit_root = units[0][1] if units else root
-            ver_passed, ver_results = run_verification(
-                first_unit_root, ver_cmds, risk, all_files)
+            ver_passed, ver_results = run_verification(root, ver_cmds, risk, all_files)
         else:
-            ver_results = [{"name": "auto-discovery", "passed": True,
-                           "exit_code": 0, "stdout": "", "stderr":
-                           "No verification commands configured or auto-discovered"}]
+            ver_results = []
+            for _, unit_root, langs in units:
+                commands = discover_default_verification(unit_root, langs)
+                passed, results = run_verification(unit_root, commands, risk, all_files)
+                ver_passed = ver_passed and passed
+                if len(units) > 1:
+                    for result in results:
+                        result["name"] += f" [{unit_root.relative_to(root).as_posix()}]"
+                ver_results.extend(results)
+            if not ver_results:
+                ver_results = [{"name": "auto-discovery", "passed": True,
+                                "exit_code": 0, "stdout": "", "stderr":
+                                "No verification commands configured or auto-discovered"}]
 
     if args.json:
         output = {"risk": risk, "file_count": len(all_files),

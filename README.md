@@ -93,6 +93,7 @@ bash install.sh --uninstall
 
 - **Claude Code** CLI
 - **Python 3.8+**（review_scan.py 仅用标准库，零第三方依赖）
+- **Go、Flutter 或 Dart SDK**（仅在 `--verify` 执行对应项目的验证命令时需要）
 - **opengrep**（可选，用于 SAST 扫描）
 
 ---
@@ -158,15 +159,27 @@ AI 审查的问题：
 
 | ID | 维度 | 说明 |
 |---|---|---|
-| S1 | 路由清单 | 多框架自动识别（FastAPI/Flask/Django/Express/NestJS/Koa/Spring/gin/echo/axum/actix） |
+| S1 | 路由清单 | 多框架自动识别（FastAPI/Flask/Django/Express/NestJS/Koa/Spring/gin/Echo/net/http/axum/actix） |
 | S2 | 鉴权 | 路由是否有鉴权标志（跨框架通用 + `.code-review.yml` 可追加） |
 | S3 | SSRF | URL 参数是否校验目标地址 |
 | S4 | 密钥 | 硬编码密钥/密码/Token（16 位以上字符串赋值） |
 | S5 | 跨存储删除 | 删实体函数是否覆盖全部关联存储 |
-| S6 | 裸 fetch | 前端直接 `fetch()` 调用（排除 auth client 封装） |
-| S7 | 错误吞没 | `except: pass` / `catch: return null` 不 raise |
+| S6 | 直接 HTTP 调用 | JS/TS 裸 `fetch()` 和 Dart 的 `package:http` 顶层请求调用，可配置排除项目封装 |
+| S7 | 错误吞没 | 例如 Python `except: pass`、Go 空错误分支、Dart 空异常处理或直接返回 `null` |
 | S8 | 无界重试/OOM | `while True` 无 break / 循环内无界 append |
 | S9 | 时间戳污染 | 客户端 `Date.now()` 用于比较/排序 |
+
+### Go 和 Flutter / Dart
+
+| 项目 | 自动扫描 | 默认验证（`--verify`） |
+|---|---|---|
+| Go（`go.mod`） | gin、Echo 和 `net/http` 字面量路由，硬编码密钥，空错误分支 | `go test ./...`、`go vet ./...` |
+| Flutter（使用 Flutter SDK 的 `pubspec.yaml`） | `.dart` 文件中的硬编码密钥、空异常处理和直接 `package:http` 请求 | `flutter analyze`，存在 `test/**/*_test.dart` 时运行 `flutter test` |
+| Dart（其他 `pubspec.yaml`） | 同上，含 `bin/` 下的 Dart 入口 | `dart analyze`，存在 `test/**/*_test.dart` 时运行 `dart test` |
+
+路由清单用于追踪 Go 中间件和 handler 的实际鉴权。轻审也检查 Go 的错误传播与并发取消，以及 Flutter 的异步生命周期和资源释放。可用 `fetch_impl_files` 配置共享 HTTP 客户端文件，避免它自身的请求被标记。
+
+纯 Dart 项目首次验证前，用 `dart pub get` 安装项目依赖。
 
 ### 用法
 
@@ -222,7 +235,7 @@ verification:
 - `on_risk`：按风险级别过滤
 - `on_paths`：按改动路径过滤
 
-未配置 `verification` 时，扫描器自动发现默认命令（pytest / mvn test / npm test / tsc 等）。
+未配置 `verification.commands` 时，扫描器在各项目目录运行自动发现的默认命令。配置了命令时，`cwd` 相对于 `--root` 指定的目录。
 
 ---
 
